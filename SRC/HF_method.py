@@ -13,9 +13,377 @@ import signal
 import sys
 import os
 import gc
+from torchvision import transforms
+import itertools
+from torchvision.transforms import functional as TF  # Use torchvision's functional instead of F
 
 # Import PEFT/LoRA utilities
 from peft import LoraConfig, get_peft_model
+
+# Add these utility functions
+def print_trainable_parameters(model):
+    """Simplified parameter counter"""
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(f"Trainable params: {trainable_params:,d} | Total: {all_param:,d} | Trainable%: {100 * trainable_params / all_param:.2f}%")
+
+def analyze_model(model, title="Model Analysis"):
+    """
+    Analyze and print detailed information about the model architecture,
+    parameters, and LoRA modifications.
+    """
+    print(f"\n{'='*50}")
+    print(f"{title:^50}")
+    print(f"{'='*50}\n")
+
+    # 1. Basic Model Information
+    print("1. Model Class:", model.__class__.__name__)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Format large numbers
+    def format_number(num):
+        if num >= 1e9:
+            return f"{num/1e9:.2f}B"
+        if num >= 1e6:
+            return f"{num/1e6:.2f}M"
+        if num >= 1e3:
+            return f"{num/1e3:.2f}K"
+        return str(num)
+    
+    print(f"Total Parameters: {format_number(total_params)}")
+    print(f"Trainable Parameters: {format_number(trainable_params)}")
+    print(f"Percentage Trainable: {(trainable_params/total_params)*100:.2f}%\n")
+
+    # 2. LoRA Analysis
+    print("2. LoRA Modules Analysis:")
+    lora_params = 0
+    found_lora = False
+    
+    for name, module in model.named_modules():
+        if 'lora_' in name:
+            found_lora = True
+            print(f"\nFound LoRA in: {name}")
+            if hasattr(module, 'weight'):
+                print(f"Shape: {module.weight.shape}")
+                lora_params += module.weight.numel()
+
+    if found_lora:
+        print(f"\nTotal LoRA Parameters: {format_number(lora_params)}")
+        print(f"LoRA Parameter %: {(lora_params/total_params)*100:.4f}%")
+    else:
+        print("\nNo LoRA modules found!")
+
+    # 3. Device Information
+    print("\n3. Device Information:")
+    print(f"Model is on: {next(model.parameters()).device}")
+    
+    if torch.cuda.is_available():
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated()/1e6:.2f} MB")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("Running on Apple Silicon (MPS)")
+
+def inspect_lora_weights(model):
+    """
+    Print the actual values of LoRA weights
+    """
+    for name, param in model.named_parameters():
+        if 'lora_' in name:
+            print(f"\nLoRA Weight: {name}")
+            print(f"Shape: {param.shape}")
+            print(f"Mean: {param.mean().item():.6f}")
+            print(f"Std: {param.std().item():.6f}")
+            print(f"Min: {param.min().item():.6f}")
+            print(f"Max: {param.max().item():.6f}")
+
+# Model Configuration
+MODEL_CONFIG = {
+    "name": "runwayml/stable-diffusion-v1-5",
+    "version": "v1.5",
+    "description": "Improved SD version with better image quality and prompt understanding",
+    "vae_path": None,  # Set to a specific VAE if needed
+    "lora_config": {
+        "r": 16,
+        "lora_alpha": 32,
+        "target_modules": [
+            "to_k",
+            "to_q",
+            "to_v",
+            "to_out.0",
+        ],
+        "lora_dropout": 0.05,
+        "bias": "none",
+    }
+}
+
+def setup_mps_device():
+    """Setup MPS device with proper memory management"""
+    if torch.backends.mps.is_available():
+        # Set a conservative memory limit (70% of available memory)
+        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.7'
+        device = "mps"
+    else:
+        device = "cpu"
+    
+    return device, torch.float32
+
+def setup_model_and_pipeline():
+    """Setup model pipeline with proper error handling"""
+    try:
+        # Setup device first
+        device, torch_dtype = setup_mps_device()
+        print(f"Using device: {device}, dtype: {torch_dtype}")
+        
+        # Load pipeline components
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            MODEL_CONFIG["name"],
+            torch_dtype=torch_dtype,
+            safety_checker=None,
+            requires_safety_checker=False
+        )
+        
+        # Move to device safely
+        try:
+            pipeline = pipeline.to(device)
+        except RuntimeError as e:
+            print(f"Error moving pipeline to {device}, falling back to CPU: {str(e)}")
+            device = "cpu"
+            pipeline = pipeline.to(device)
+        
+        print(f"Model loaded on: {device}")
+        
+        return (
+            pipeline,
+            pipeline.unet,
+            pipeline.vae,
+            pipeline.text_encoder,
+            pipeline.tokenizer,
+            pipeline.scheduler,
+            device,
+            torch_dtype
+        )
+        
+    except Exception as e:
+        print(f"Error in setup_model_and_pipeline: {str(e)}")
+        raise
+
+def load_and_prepare_dataset():
+    """Load the Hopper dataset"""
+    print("Loading Hopper fine-tuning dataset...")
+    
+    try:
+        dataset = load_dataset(
+            "kooshkashkai/hopper-finetuning-dataset",
+            cache_dir="dataset_cache"
+        )
+        print(f"Dataset loaded with {len(dataset['train'])} examples")
+        return dataset["train"]
+    except Exception as e:
+        print(f"Dataset loading failed: {str(e)}")
+        raise
+
+def collate_fn(examples):
+    """Process batch of examples with shape verification"""
+    pixel_values = []
+    captions = []
+    
+    for example in examples:
+        pv = example["pixel_values"]
+        if not isinstance(pv, torch.Tensor):
+            pv = torch.tensor(pv)
+        
+        pv = pv.float()
+        
+        # Ensure correct shape [C, H, W]
+        if len(pv.shape) == 3:
+            if pv.shape[2] == 3:  # If [H, W, C]
+                pv = pv.permute(2, 0, 1)  # Convert to [C, H, W]
+        
+        # Resize if needed
+        if pv.shape[-2:] != (512, 512):
+            pv = TF.resize(pv, [512, 512], antialias=True)
+        
+        # Normalize
+        pv = (pv / 127.5) - 1.0
+        
+        pixel_values.append(pv)
+        captions.append(example["caption"])
+    
+    return {
+        "pixel_values": torch.stack(pixel_values),
+        "caption": captions
+    }
+
+class ProgressDataLoader:
+    """Wrapper for DataLoader with progress bar"""
+    def __init__(self, dataloader, desc="Processing batches"):
+        self.dataloader = dataloader
+        self.desc = desc
+        self.total = len(dataloader)
+    
+    def __iter__(self):
+        return iter(tqdm(
+            self.dataloader,
+            desc=self.desc,
+            total=self.total,
+            unit="batch"
+        ))
+    
+    def __len__(self):
+        return len(self.dataloader)
+
+def validate_batch(batch, batch_idx=0):
+    """Validate batch contents with timing"""
+    start_time = time.time()
+    
+    print(f"\nValidating batch {batch_idx}:")
+    print(f"├─ Pixel values:")
+    print(f"│  ├─ Shape: {batch['pixel_values'].shape}")
+    print(f"│  ├─ Type: {batch['pixel_values'].dtype}")
+    print(f"│  ├─ Range: [{batch['pixel_values'].min():.2f}, {batch['pixel_values'].max():.2f}]")
+    print(f"│  └─ Memory: {batch['pixel_values'].element_size() * batch['pixel_values'].nelement() / 1024:.2f} KB")
+    print(f"├─ Captions:")
+    print(f"│  ├─ Count: {len(batch['caption'])}")
+    print(f"│  └─ First caption length: {len(batch['caption'][0])}")
+    
+    end_time = time.time()
+    print(f"└─ Validation time: {(end_time - start_time)*1000:.2f}ms")
+
+def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_scheduler, device):
+    """Training function with memory management"""
+    print("Starting training...")
+    
+    # Setup models
+    unet.train()
+    vae.eval()
+    text_encoder.eval()
+    
+    # Freeze VAE and text encoder
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    
+    optimizer = torch.optim.AdamW(
+        unet.parameters(),
+        lr=1e-4,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2
+    )
+    
+    num_epochs = 3
+    progress_bar = tqdm(range(num_epochs), desc="Epochs")
+    
+    for epoch in range(num_epochs):
+        for step, batch in enumerate(train_dataloader):
+            try:
+                if device == "mps":
+                    torch.mps.empty_cache()
+                
+                with torch.no_grad():
+                    tokens = tokenizer(
+                        batch["caption"],
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).input_ids.to(device)
+                    
+                    encoder_hidden_states = text_encoder(tokens)[0]
+                
+                pixel_values = batch["pixel_values"].to(device)
+                
+                with torch.no_grad():
+                    latents = vae.encode(pixel_values).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor
+                
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                                       (latents.shape[0],), device=device)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                
+                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                if step % 10 == 0:
+                    print(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}")
+                
+                del noise_pred, latents, noisy_latents
+                if device == "mps":
+                    torch.mps.empty_cache()
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"OOM at epoch {epoch}, step {step}. Clearing cache...")
+                    if device == "mps":
+                        torch.mps.empty_cache()
+                    continue
+                raise e
+        
+        progress_bar.update(1)
+    
+    return unet
+
+def main():
+    # Initialize device variable at the start
+    device = "cpu"  # Default fallback
+    
+    try:
+        # Setup
+        (pipeline, unet, vae, text_encoder, tokenizer, 
+         noise_scheduler, device, torch_dtype) = setup_model_and_pipeline()
+        
+        # Load dataset
+        print("\n=== Loading Dataset ===")
+        dataset = load_and_prepare_dataset()
+        
+        # Create DataLoader
+        train_dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn
+        )
+        
+        # Train
+        trained_unet = train_unet(
+            unet=unet,
+            vae=vae,
+            text_encoder=text_encoder,
+            train_dataloader=train_dataloader,
+            tokenizer=tokenizer,
+            noise_scheduler=noise_scheduler,
+            device=device
+        )
+        
+        # Save model
+        save_dir = "trained_model"
+        os.makedirs(save_dir, exist_ok=True)
+        pipeline.save_pretrained(save_dir)
+        print(f"Model saved to {save_dir}")
+        
+    except Exception as e:
+        print(f"\nError during training: {str(e)}")
+        print("\nDebug information:")
+        print(f"Device: {device}")
+        if device == "mps":
+            try:
+                print(f"Memory allocated: {torch.mps.current_allocated_memory() / 1e9:.2f}GB")
+            except Exception as mem_e:
+                print(f"Could not get memory info: {str(mem_e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
 
 # ==========================
 # Configuration & Hyperparameters
@@ -103,19 +471,6 @@ print("Model device:", next(unet.parameters()).device)
 print("LoRA applied successfully!")
 
 # Optional: Print trainable parameters
-def print_trainable_parameters(model):
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params:,d} || "
-        f"all params: {all_param:,d} || "
-        f"trainable%: {100 * trainable_params / all_param:.2f}%"
-    )
-
 print_trainable_parameters(unet)
 
 # ==========================
@@ -231,183 +586,6 @@ signal.signal(signal.SIGINT, signal_handler)
 os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.7'  # Adjust memory limit
 torch.mps.empty_cache()
 
-def train_unet(
-    unet,
-    vae,
-    text_encoder,
-    dataset,
-    num_epochs=50,
-    batch_size=1,  # Reduced batch size for MPS
-    learning_rate=1e-4,
-    gradient_accumulation_steps=4,
-    save_dir="checkpoints"
-):
-    global should_stop
-    
-    # Create save directory
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Setup accelerator with memory optimization
-    accelerator = Accelerator(
-        mixed_precision="no",
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        kwargs_handlers=[{"no_sync_in_gradient_accumulation": True}]
-    )
-
-    # Create dataloader with smaller batch size
-    train_dataloader = torch.utils.data.DataLoader(
-        dataset["train"],
-        batch_size=batch_size,
-        shuffle=True,
-        pin_memory=True
-    )
-
-    # Optimizer with gradient clipping
-    optimizer = torch.optim.AdamW(
-        unet.parameters(),
-        lr=learning_rate,
-        weight_decay=0.01
-    )
-
-    # Prepare everything
-    unet, optimizer, train_dataloader = accelerator.prepare(
-        unet, optimizer, train_dataloader
-    )
-
-    # Training metrics
-    best_loss = float('inf')
-    running_loss = []
-    
-    # Setup progress bars
-    epoch_pbar = tqdm(range(num_epochs), desc="Epochs", position=0)
-    batch_pbar = tqdm(total=len(train_dataloader), desc="Batches", position=1, leave=False)
-    metrics_pbar = tqdm(total=0, bar_format='{desc}', position=2)
-
-    try:
-        start_time = time.time()
-        
-        for epoch in range(num_epochs):
-            if should_stop:
-                print("\nGracefully stopping training...")
-                break
-                
-            unet.train()
-            epoch_loss = 0
-            batch_pbar.reset()
-            
-            for step, batch in enumerate(train_dataloader):
-                # Memory management
-                if step % 10 == 0:
-                    torch.mps.empty_cache()
-                    gc.collect()
-
-                with accelerator.accumulate(unet):
-                    try:
-                        # Process in smaller chunks if needed
-                        with torch.cuda.amp.autocast() if torch.cuda.is_available() else nullcontext():
-                            # Forward pass with memory optimization
-                            with torch.no_grad():
-                                encoder_hidden_states = text_encoder(
-                                    batch["input_ids"].to(accelerator.device)
-                                )[0]
-                                
-                                latents = vae.encode(
-                                    batch["pixel_values"].to(accelerator.device)
-                                ).latent_dist.sample()
-                                latents = latents * vae.config.scaling_factor
-
-                            # Free up memory
-                            del batch["pixel_values"]
-                            torch.mps.empty_cache()
-
-                            # Forward pass through U-Net
-                            noise_pred = unet(
-                                latents,
-                                encoder_hidden_states=encoder_hidden_states
-                            ).sample
-
-                            # Calculate loss
-                            loss = torch.nn.functional.mse_loss(
-                                noise_pred.float(),
-                                batch["target"].to(accelerator.device).float()
-                            )
-
-                        # Backward pass
-                        accelerator.backward(loss)
-
-                        # Gradient clipping
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)  # Memory optimization
-
-                        # Update metrics
-                        epoch_loss += loss.item()
-                        running_loss.append(loss.detach().item())
-                        if len(running_loss) > 50:  # Keep shorter running average
-                            running_loss.pop(0)
-
-                        # Update progress
-                        avg_loss = sum(running_loss) / len(running_loss)
-                        metrics_pbar.set_description_str(
-                            f"Loss: {avg_loss:.4f} | Batch: {step}/{len(train_dataloader)}"
-                        )
-                        batch_pbar.update(1)
-
-                    except RuntimeError as e:
-                        if "out of memory" in str(e):
-                            torch.mps.empty_cache()
-                            gc.collect()
-                            print(f"\nOOM error in batch {step}. Skipping...")
-                            continue
-                        raise e
-
-                # Save checkpoint periodically
-                if step % 100 == 0:
-                    accelerator.save_state(f"{save_dir}/checkpoint-epoch{epoch}-step{step}")
-            
-            # Update epoch progress
-            epoch_pbar.update(1)
-            
-            # Save checkpoint every 5 epochs
-            if (epoch + 1) % 5 == 0:
-                accelerator.save_state(f"{save_dir}/checkpoint-{epoch+1}")
-                
-            # Save latest state
-            accelerator.save_state(f"{save_dir}/latest")
-
-    except Exception as e:
-        print(f"\nError during training: {e}")
-        # Save emergency checkpoint
-        accelerator.save_state(f"{save_dir}/emergency_save")
-        raise
-        
-    finally:
-        # Clean up progress bars
-        batch_pbar.close()
-        epoch_pbar.close()
-        metrics_pbar.close()
-        
-        # Save final model
-        if not should_stop:  # Only if training completed normally
-            accelerator.save_state(f"{save_dir}/final_model")
-        
-        # Print training summary
-        print("\nTraining Summary:")
-        print(f"Total time: {time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time))}")
-        print(f"Best loss: {best_loss:.4f}")
-        print(f"Final loss: {avg_loss:.4f}")
-
-    return unet
-
-# Verify setup
-print("\nVerifying setup:")
-print(f"VAE dtype: {next(vae.parameters()).dtype}")
-print(f"UNet dtype: {next(unet.parameters()).dtype}")
-print(f"Text Encoder dtype: {next(text_encoder.parameters()).dtype}")
-
-# Memory optimization settings
 def optimize_memory():
     torch.mps.empty_cache()
     gc.collect()
@@ -423,10 +601,9 @@ try:
         vae,
         text_encoder,
         dataset,
-        num_epochs=50,
-        batch_size=1,  # Keep batch size small
-        learning_rate=1e-4,
-        gradient_accumulation_steps=4
+        tokenizer,
+        noise_scheduler,
+        device=device
     )
     print("Training completed successfully!")
 except Exception as e:
