@@ -1,0 +1,100 @@
+# Speccific
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+/images
+/checkpoints
+/runs
+/wandb
+/venv
+/ENV
+/env
+/TuningData
+/EXPERIMENTS
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env/
+
+# ML Specific
+checkpoints/
+runs/
+wandb/
+*.pth
+*.ckpt
+*.pt
+*.bin
+*.onnx
+*.tflite
+*.h5
+dataset_images/
+TuningData/
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Large media files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.mov
+*.avi
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Local development settings
+local_settings.py
