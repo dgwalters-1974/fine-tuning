@@ -137,7 +137,8 @@ def setup_model_and_pipeline():
     """Setup model pipeline with proper error handling"""
     try:
         # Setup device first
-        device, torch_dtype = setup_mps_device()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float32  # Use float32 for better stability
         print(f"Using device: {device}, dtype: {torch_dtype}")
         
         # Load pipeline components
@@ -268,21 +269,54 @@ def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_sched
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     
+    # Configure LoRA
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        lora_dropout=0.05,
+        bias="none",
+    )
+    
+    # Apply LoRA to UNet
+    unet = get_peft_model(unet, lora_config)
+    
+    # Use a lower learning rate for LoRA
     optimizer = torch.optim.AdamW(
         unet.parameters(),
-        lr=1e-4,
+        lr=1e-5,  # Lower learning rate for LoRA
         betas=(0.9, 0.999),
         weight_decay=1e-2
+    )
+    
+    # Add gradient clipping
+    max_grad_norm = 1.0
+    
+    # Initialize accelerator with no mixed precision for now
+    accelerator = Accelerator(
+        mixed_precision="no",  # Disable mixed precision to avoid FP16 gradient issues
+        gradient_accumulation_steps=4,
+        device_placement=True
+    )
+    
+    # Prepare models and optimizer
+    unet, optimizer, train_dataloader = accelerator.prepare(
+        unet, optimizer, train_dataloader
     )
     
     num_epochs = 3
     progress_bar = tqdm(range(num_epochs), desc="Epochs")
     
+    # Initialize loss tracking
+    running_loss = 0.0
+    num_batches = 0
+    
     for epoch in range(num_epochs):
+        epoch_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             try:
-                if device == "mps":
-                    torch.mps.empty_cache()
+                # Convert pixel values to float32
+                pixel_values = batch["pixel_values"].to(device).float()
                 
                 with torch.no_grad():
                     tokens = tokenizer(
@@ -295,38 +329,66 @@ def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_sched
                     
                     encoder_hidden_states = text_encoder(tokens)[0]
                 
-                pixel_values = batch["pixel_values"].to(device)
-                
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * vae.config.scaling_factor
+                
+                # Scale down the latents to prevent numerical instability
+                latents = latents * 0.18215  # Additional scaling factor
                 
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
                                        (latents.shape[0],), device=device)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
+                # Forward pass
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                loss = F.mse_loss(noise_pred, noise, reduction="mean")
                 
-                loss.backward()
+                # Check for NaN loss
+                if torch.isnan(loss):
+                    print(f"NaN loss detected at epoch {epoch+1}, step {step}. Skipping batch...")
+                    optimizer.zero_grad()
+                    continue
+                
+                accelerator.backward(loss)
+                
+                # Clip gradients using standard PyTorch method
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_grad_norm)
+                
                 optimizer.step()
                 optimizer.zero_grad()
                 
+                # Update loss tracking
+                epoch_loss += loss.item()
+                running_loss += loss.item()
+                num_batches += 1
+                
                 if step % 10 == 0:
-                    print(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}")
+                    avg_loss = running_loss / num_batches
+                    print(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}")
+                    running_loss = 0.0
+                    num_batches = 0
                 
                 del noise_pred, latents, noisy_latents
-                if device == "mps":
-                    torch.mps.empty_cache()
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     print(f"OOM at epoch {epoch}, step {step}. Clearing cache...")
-                    if device == "mps":
-                        torch.mps.empty_cache()
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
                     continue
                 raise e
+        
+        # Print epoch statistics
+        avg_epoch_loss = epoch_loss / len(train_dataloader)
+        print(f"\nEpoch {epoch+1} completed. Average Loss: {avg_epoch_loss:.4f}")
+        
+        # Save checkpoint after each epoch
+        save_dir = f"checkpoints/epoch_{epoch+1}"
+        os.makedirs(save_dir, exist_ok=True)
+        unet.save_pretrained(save_dir)
+        print(f"Saved checkpoint to {save_dir}")
         
         progress_bar.update(1)
     
@@ -345,12 +407,12 @@ def main():
         print("\n=== Loading Dataset ===")
         dataset = load_and_prepare_dataset()
         
-        # Create DataLoader
+        # Create DataLoader with larger batch size
         train_dataloader = DataLoader(
             dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
+            batch_size=4,  # Increased batch size
+            shuffle=True,  # Enable shuffling
+            num_workers=2,  # Add workers for faster data loading
             collate_fn=collate_fn
         )
         
@@ -365,19 +427,22 @@ def main():
             device=device
         )
         
-        # Save model
+        # Save LoRA weights
         save_dir = "trained_model"
         os.makedirs(save_dir, exist_ok=True)
-        pipeline.save_pretrained(save_dir)
-        print(f"Model saved to {save_dir}")
+        trained_unet.save_pretrained(save_dir)
+        print(f"LoRA weights saved to {save_dir}")
+        
+        # Print model analysis
+        analyze_model(trained_unet, "Final Trained Model Analysis")
         
     except Exception as e:
         print(f"\nError during training: {str(e)}")
         print("\nDebug information:")
         print(f"Device: {device}")
-        if device == "mps":
+        if device == "cuda":
             try:
-                print(f"Memory allocated: {torch.mps.current_allocated_memory() / 1e9:.2f}GB")
+                print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f}GB")
             except Exception as mem_e:
                 print(f"Could not get memory info: {str(mem_e)}")
         raise
@@ -385,241 +450,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# ==========================
-# Configuration & Hyperparameters
-# ==========================
-model_id = "CompVis/stable-diffusion-v1-4"  # Base model identifier
-batch_size = 4
-learning_rate = 1e-4
-num_epochs = 3
-
-# Device and dtype setup
-def get_device_and_dtype():
-    if torch.cuda.is_available():
-        return "cuda", torch.float16
-    elif torch.backends.mps.is_available():
-        return "mps", torch.float32  # MPS needs float32
-    return "cpu", torch.float32
-
-device, dtype = get_device_and_dtype()
-print(f"Using device: {device}, dtype: {dtype}")
-
-# ==========================
-# Load HF Dataset
-# ==========================
-# Our dataset: Hopper fine-tuning dataset
-dataset = load_dataset("kooshkashkai/hopper-finetuning-dataset", split="train")
-
-def collate_fn(examples):
-    # Convert each pixel_values (stored as a NumPy array) into a torch.Tensor.
-    images = [torch.tensor(example["pixel_values"]) for example in examples]
-    captions = [example["caption"] for example in examples]
-    return {"pixel_values": torch.stack(images), "captions": captions}
-
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
-# ==========================
-# Load Stable Diffusion Components
-# ==========================
-# Load the full Stable Diffusion pipeline.
-pipeline = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    torch_dtype=dtype,  # Use the determined dtype
-)
-pipeline.to(device)
-
-# Extract individual components.
-vae = pipeline.vae                # VAE: encodes images into latent space.
-text_encoder = pipeline.text_encoder  # CLIP text encoder.
-tokenizer = pipeline.tokenizer     # CLIP tokenizer.
-unet = pipeline.unet               # UNet: to be fine-tuned.
-noise_scheduler = pipeline.scheduler  # Diffusion noise scheduler.
-
-# Freeze VAE and text encoder.
-for param in vae.parameters():
-    param.requires_grad = False
-for param in text_encoder.parameters():
-    param.requires_grad = False
-
-# ==========================
-# Integrate LoRA into UNet
-# ==========================
-# List of valid target modules for Stable Diffusion U-Net
-TARGET_MODULES = [
-    "to_k",
-    "to_q",
-    "to_v",
-    "to_out.0",
-]
-
-# Configure LoRA
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=TARGET_MODULES,
-    lora_dropout=0.05,
-    bias="none",
-)
-
-# Apply LoRA to U-Net
-unet = pipeline.unet
-unet = get_peft_model(unet, lora_config)
-unet.to(device).to(dtype)
-
-# Verify the setup
-print("Model device:", next(unet.parameters()).device)
-print("LoRA applied successfully!")
-
-# Optional: Print trainable parameters
-print_trainable_parameters(unet)
-
-# ==========================
-# Set Up Optimizer
-# ==========================
-optimizer = torch.optim.AdamW(unet.parameters(), lr=learning_rate)
-
-# ==========================
-# Initialize Accelerator (for multi-GPU/distributed training)
-# ==========================
-accelerator = Accelerator(
-    mixed_precision="no",  # Disable mixed precision to ensure dtype consistency
-    gradient_accumulation_steps=4
-)
-
-print(f"Using device: {accelerator.device}")
-print(f"Mixed precision: {accelerator.mixed_precision}")
-
-# ==========================
-# Training Loop
-# ==========================
-accelerator.print("Starting LoRA fine-tuning for Hopper style...")
-
-for epoch in range(num_epochs):
-    accelerator.print(f"Epoch {epoch+1}/{num_epochs}")
-    for batch in dataloader:
-        optimizer.zero_grad()
-        
-        # --- Prepare Inputs ---
-        # Move images to the accelerator's device and cast to float16.
-        images = batch["pixel_values"].to(accelerator.device).to(dtype)  # [B, C, H, W]
-        captions = batch["captions"]
-        
-        # Tokenize captions.
-        text_inputs = tokenizer(
-            captions,
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt"
-        )
-        input_ids = text_inputs.input_ids.to(accelerator.device)
-        
-        # Encode text into hidden states.
-        encoder_hidden_states = text_encoder(input_ids)[0]
-        
-        # --- Encode Images ---
-        with torch.no_grad():
-            latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
-        
-        # --- Add Noise ---
-        noise = torch.randn(latents.shape, device=accelerator.device, dtype=latents.dtype)
-        bs = latents.shape[0]
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=accelerator.device).long()
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        
-        # --- Forward Pass through LoRA-adapted UNet ---
-        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        
-        # --- Compute Loss ---
-        loss = F.mse_loss(noise_pred, noise)
-        
-        accelerator.backward(loss)
-        optimizer.step()
-        
-        accelerator.print(f"Loss: {loss.item():.4f}")
-    
-    # Optionally save a checkpoint after each epoch.
-    torch.save(unet.state_dict(), f"unet_epoch_{epoch+1}_lora.pt")
-
-# ==========================
-# Save the Fine-Tuned Model
-# ==========================
-unet.save_pretrained("stable-diffusion-lora-finetuned")
-accelerator.print("LoRA fine-tuning complete. Model saved as 'stable-diffusion-lora-finetuned'.")
-
-# Function to print model structure
-def print_model_structure(model, depth=0, max_depth=2):
-    """Print the structure of the model's named modules."""
-    for name, module in model.named_modules():
-        if depth <= max_depth:
-            print("  " * depth + f"{name}: {module.__class__.__name__}")
-
-# Inspect U-Net structure
-print("U-Net Structure:")
-print_model_structure(pipeline.unet)
-
-# Training function with device handling
-def process_batch(batch, vae, dtype):
-    """Process a batch of images through VAE with correct dtype"""
-    with torch.no_grad():
-        # Ensure images are in the correct dtype
-        images = batch["pixel_values"].to(device).to(dtype)
-        latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
-    return latents
-
-# Global flag for graceful interruption
-should_stop = False
-
-def signal_handler(signum, frame):
-    """Handle interrupt signal"""
-    global should_stop
-    if not should_stop:
-        print("\nInterrupt received. Will stop after current epoch. Press Ctrl+C again to force quit.")
-        should_stop = True
-    else:
-        print("\nForce quitting...")
-        sys.exit(1)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# Memory management settings for MPS
-os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.7'  # Adjust memory limit
-torch.mps.empty_cache()
-
-def optimize_memory():
-    torch.mps.empty_cache()
-    gc.collect()
-    print("Memory cleared")
-
-# Start training with memory optimization
-print("Initializing training...")
-optimize_memory()
-
-try:
-    trained_unet = train_unet(
-        unet,
-        vae,
-        text_encoder,
-        dataset,
-        tokenizer,
-        noise_scheduler,
-        device=device
-    )
-    print("Training completed successfully!")
-except Exception as e:
-    print(f"Training failed: {e}")
-    raise
-
-# Save the final model
-pipeline.save_pretrained("fine_tuned_model")
-
-# Test model loading
-pipeline = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5",
-    torch_dtype=dtype,
-)
-print("Model loaded successfully!")
-
-# Verify U-Net structure
-print("\nU-Net target modules:")
-print_model_structure(pipeline.unet)
+# Remove everything after this point
