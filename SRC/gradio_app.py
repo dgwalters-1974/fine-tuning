@@ -46,20 +46,44 @@ def setup_pipeline(model_path="trained_model"):
     print(f"\nModel loaded on {device}")
     return pipeline
 
+def setup_base_pipeline():
+    """Load the original Stable Diffusion pipeline"""
+    print("Loading original Stable Diffusion model...")
+    pipeline = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=torch.float32,
+        safety_checker=None,
+        requires_safety_checker=False
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipeline = pipeline.to(device)
+    print(f"Original model loaded on {device}")
+    return pipeline
+
 def generate_images(prompt):
-    """Generate both base and Hopper style images"""
+    """Generate three images: original SD, fine-tuned SD, and fine-tuned SD with Hopper style"""
     try:
-        # Generate base image
-        base_output = pipeline(
+        # Generate image with original Stable Diffusion
+        base_output = base_pipeline(
             prompt=prompt,
             negative_prompt="blurry, bad quality, distorted, ugly",
             num_inference_steps=50,
             guidance_scale=7.5,
             output_type="pil"
         )
-        base_image = base_output.images[0]
+        original_image = base_output.images[0]
         
-        # Generate Hopper style image
+        # Generate image with fine-tuned model
+        finetuned_output = pipeline(
+            prompt=prompt,
+            negative_prompt="blurry, bad quality, distorted, ugly",
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            output_type="pil"
+        )
+        finetuned_image = finetuned_output.images[0]
+        
+        # Generate image with fine-tuned model and Hopper style
         hopper_prompt = f"{prompt} in Edward Hopper style"
         hopper_output = pipeline(
             prompt=hopper_prompt,
@@ -70,14 +94,15 @@ def generate_images(prompt):
         )
         hopper_image = hopper_output.images[0]
         
-        return base_image, hopper_image
+        return original_image, finetuned_image, hopper_image
         
     except Exception as e:
         print(f"Error generating images: {str(e)}")
-        return None, None
+        return None, None, None
 
-# Initialize the pipeline
+# Initialize both pipelines
 pipeline = setup_pipeline()
+base_pipeline = setup_base_pipeline()
 
 # Create the Gradio interface
 def create_interface():
@@ -85,9 +110,10 @@ def create_interface():
         gr.Markdown("""
         # Edward Hopper Style Generator
         
-        Enter a description below to generate two images:
-        1. A standard image based on your description
-        2. The same image in Edward Hopper's style
+        Enter a description below to generate three images:
+        1. Original Stable Diffusion model
+        2. Fine-tuned Stable Diffusion model
+        3. Fine-tuned model with Edward Hopper style
         
         Example prompts:
         - "a city street at night"
@@ -111,13 +137,14 @@ def create_interface():
             
             with gr.Column():
                 with gr.Row():
-                    base_output = gr.Image(label="Standard Image")
-                    hopper_output = gr.Image(label="Hopper Style Image")
+                    original_output = gr.Image(label="Original Stable Diffusion")
+                    finetuned_output = gr.Image(label="Fine-tuned Model")
+                    hopper_output = gr.Image(label="Hopper Style")
         
         generate_btn.click(
             fn=generate_images,
             inputs=prompt_input,
-            outputs=[base_output, hopper_output]
+            outputs=[original_output, finetuned_output, hopper_output]
         )
     
     return interface
