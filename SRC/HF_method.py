@@ -15,7 +15,9 @@ import os
 import gc
 from torchvision import transforms
 import itertools
-from torchvision.transforms import functional as TF  # Use torchvision's functional instead of F
+from torchvision.transforms import functional as TF
+import random
+from PIL import Image, ImageEnhance
 
 # Import PEFT/LoRA utilities
 from peft import LoraConfig, get_peft_model
@@ -33,8 +35,8 @@ def print_trainable_parameters(model):
 
 def analyze_model(model, title="Model Analysis"):
     """
-    Analyze and print detailed information about the model architecture,
-    parameters, and LoRA modifications.
+    Analyze and print summary information about the model architecture
+    and parameters, without detailed layer listings.
     """
     print(f"\n{'='*50}")
     print(f"{title:^50}")
@@ -61,24 +63,23 @@ def analyze_model(model, title="Model Analysis"):
     print(f"Trainable Parameters: {format_number(trainable_params)}")
     print(f"Percentage Trainable: {(trainable_params/total_params)*100:.2f}%\n")
 
-    # 2. LoRA Analysis
-    print("2. LoRA Modules Analysis:")
+    # 2. LoRA Summary (without detailed layer listing)
+    print("2. LoRA Summary:")
     lora_params = 0
-    found_lora = False
+    lora_module_count = 0
     
     for name, module in model.named_modules():
         if 'lora_' in name:
-            found_lora = True
-            print(f"\nFound LoRA in: {name}")
+            lora_module_count += 1
             if hasattr(module, 'weight'):
-                print(f"Shape: {module.weight.shape}")
                 lora_params += module.weight.numel()
 
-    if found_lora:
-        print(f"\nTotal LoRA Parameters: {format_number(lora_params)}")
+    if lora_module_count > 0:
+        print(f"Total LoRA Modules: {lora_module_count}")
+        print(f"Total LoRA Parameters: {format_number(lora_params)}")
         print(f"LoRA Parameter %: {(lora_params/total_params)*100:.4f}%")
     else:
-        print("\nNo LoRA modules found!")
+        print("No LoRA modules found!")
 
     # 3. Device Information
     print("\n3. Device Information:")
@@ -109,16 +110,15 @@ MODEL_CONFIG = {
     "description": "Improved SD version with better image quality and prompt understanding",
     "vae_path": None,  # Set to a specific VAE if needed
     "lora_config": {
-        "r": 16,
-        "lora_alpha": 32,
+        "r": 32,  # Increased from 16 to 32 for more expressiveness
+        "lora_alpha": 64,  # Increased from 32 to 64 for stronger style influence
         "target_modules": [
-            "to_k",
-            "to_q",
-            "to_v",
-            "to_out.0",
+            "to_k", "to_q", "to_v", "to_out.0",
+            "proj_in", "proj_out",  # Added projection layers
+            "conv_in", "conv_out"   # Added convolution layers
         ],
-        "lora_dropout": 0.05,
-        "bias": "none",
+        "lora_dropout": 0.1,  # Increased dropout slightly for better generalization
+        "bias": "none"
     }
 }
 
@@ -189,10 +189,73 @@ def load_and_prepare_dataset():
         print(f"Dataset loading failed: {str(e)}")
         raise
 
+# Add Hopper-specific augmentation transforms
+class HopperAugmentation:
+    """Custom augmentation class for Hopper-style images"""
+    def __init__(self, size=512):
+        self.size = size
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.2,  # Subtle brightness changes
+            contrast=0.2,    # Subtle contrast changes
+            saturation=0.1,  # Minimal saturation changes
+            hue=0.05        # Very subtle hue changes
+        )
+        
+        # Define possible geometric transforms
+        self.geometric_transforms = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=5),  # Small rotation
+            transforms.RandomAffine(
+                degrees=0,
+                translate=(0.1, 0.1),  # Small translation
+                scale=(0.9, 1.1),      # Subtle scaling
+                shear=5               # Small shear
+            )
+        ]
+        
+        # Define lighting transforms
+        self.lighting_transforms = [
+            transforms.RandomAdjustSharpness(sharpness_factor=1.2, p=0.3),
+            transforms.RandomAutocontrast(p=0.3)
+        ]
+        
+        # Resize transform
+        self.resize = transforms.Resize((size, size), antialias=True)
+        
+    def __call__(self, image):
+        # Convert to PIL Image if needed
+        if not isinstance(image, Image.Image):
+            image = TF.to_pil_image(image)
+        
+        # Apply random geometric transforms
+        for transform in random.sample(self.geometric_transforms, 
+                                    random.randint(0, len(self.geometric_transforms))):
+            image = transform(image)
+        
+        # Apply color jittering
+        if random.random() < 0.7:  # 70% chance of color jitter
+            image = self.color_jitter(image)
+        
+        # Apply lighting transforms
+        for transform in random.sample(self.lighting_transforms, 
+                                    random.randint(0, len(self.lighting_transforms))):
+            image = transform(image)
+        
+        # Ensure final size
+        image = self.resize(image)
+        
+        # Convert back to tensor
+        image = TF.to_tensor(image)
+        
+        return image
+
 def collate_fn(examples):
-    """Process batch of examples with shape verification"""
+    """Process batch of examples with augmentation"""
     pixel_values = []
     captions = []
+    
+    # Initialize augmentation
+    augmenter = HopperAugmentation(size=512)
     
     for example in examples:
         pv = example["pixel_values"]
@@ -206,9 +269,8 @@ def collate_fn(examples):
             if pv.shape[2] == 3:  # If [H, W, C]
                 pv = pv.permute(2, 0, 1)  # Convert to [C, H, W]
         
-        # Resize if needed
-        if pv.shape[-2:] != (512, 512):
-            pv = TF.resize(pv, [512, 512], antialias=True)
+        # Apply augmentation
+        pv = augmenter(pv)
         
         # Normalize
         pv = (pv / 127.5) - 1.0
@@ -257,7 +319,7 @@ def validate_batch(batch, batch_idx=0):
     print(f"└─ Validation time: {(end_time - start_time)*1000:.2f}ms")
 
 def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_scheduler, device):
-    """Training function with memory management"""
+    """Training function with memory management and augmentation"""
     print("Starting training...")
     
     # Setup models
@@ -269,17 +331,20 @@ def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_sched
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     
-    # Configure LoRA
+    # Configure LoRA with improved parameters
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        lora_dropout=0.05,
-        bias="none",
+        r=MODEL_CONFIG["lora_config"]["r"],
+        lora_alpha=MODEL_CONFIG["lora_config"]["lora_alpha"],
+        target_modules=MODEL_CONFIG["lora_config"]["target_modules"],
+        lora_dropout=MODEL_CONFIG["lora_config"]["lora_dropout"],
+        bias=MODEL_CONFIG["lora_config"]["bias"]
     )
     
     # Apply LoRA to UNet
     unet = get_peft_model(unet, lora_config)
+    
+    # Print model analysis before training
+    analyze_model(unet, "Model Analysis Before Training")
     
     # Use a lower learning rate for LoRA
     optimizer = torch.optim.AdamW(
@@ -387,11 +452,63 @@ def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_sched
         # Save checkpoint after each epoch
         save_dir = f"checkpoints/epoch_{epoch+1}"
         os.makedirs(save_dir, exist_ok=True)
-        unet.save_pretrained(save_dir)
+        
+        try:
+            print(f"\nSaving checkpoint to {save_dir}...")
+            
+            # Save LoRA weights with proper error handling
+            unet.save_pretrained(
+                save_dir,
+                is_main_process=True,
+                safe_serialization=True  # Use safetensors format
+            )
+            
+            # Verify the saved weights
+            adapter_config_path = os.path.join(save_dir, "adapter_config.json")
+            adapter_model_path_bin = os.path.join(save_dir, "adapter_model.bin")
+            adapter_model_path_safe = os.path.join(save_dir, "adapter_model.safetensors")
+            
+            if not os.path.exists(adapter_config_path):
+                print(f"Warning: adapter_config.json not found in {save_dir}")
+                print("Directory contents:", os.listdir(save_dir))
+                raise ValueError(f"Failed to save adapter_config.json in {save_dir}")
+                
+            # Check for either .bin or .safetensors format
+            if not (os.path.exists(adapter_model_path_bin) or os.path.exists(adapter_model_path_safe)):
+                print(f"Warning: Neither adapter_model.bin nor adapter_model.safetensors found in {save_dir}")
+                print("Directory contents:", os.listdir(save_dir))
+                raise ValueError(f"Failed to save adapter model weights in {save_dir}")
+            
+            # Get the actual model path that exists
+            adapter_model_path = adapter_model_path_safe if os.path.exists(adapter_model_path_safe) else adapter_model_path_bin
+            
+            # Verify file sizes
+            config_size = os.path.getsize(adapter_config_path)
+            model_size = os.path.getsize(adapter_model_path)
+            
+            if config_size == 0 or model_size == 0:
+                raise ValueError(f"Saved files have zero size: config={config_size}, model={model_size}")
+                
+            print(f"Successfully saved checkpoint:")
+            print(f"- Config file size: {config_size/1024:.2f} KB")
+            print(f"- Model file size: {model_size/1024/1024:.2f} MB")
+            print(f"- Model format: {'.safetensors' if os.path.exists(adapter_model_path_safe) else '.bin'}")
+            
+        except Exception as e:
+            print(f"\nError saving checkpoint: {str(e)}")
+            print(f"Current directory: {os.getcwd()}")
+            print(f"Save directory: {save_dir}")
+            print(f"Directory exists: {os.path.exists(save_dir)}")
+            print(f"Directory permissions: {oct(os.stat(save_dir).st_mode)[-3:]}")
+            raise
+            
         print(f"Saved checkpoint to {save_dir}")
         
+        # Remove the model analysis after each epoch
         progress_bar.update(1)
     
+    # Print final model analysis
+    analyze_model(unet, "Final Model Analysis")
     return unet
 
 def main():
@@ -427,14 +544,60 @@ def main():
             device=device
         )
         
-        # Save LoRA weights
+        # Save final LoRA weights
         save_dir = "trained_model"
         os.makedirs(save_dir, exist_ok=True)
-        trained_unet.save_pretrained(save_dir)
-        print(f"LoRA weights saved to {save_dir}")
         
-        # Print model analysis
-        analyze_model(trained_unet, "Final Trained Model Analysis")
+        try:
+            print(f"\nSaving final model to {save_dir}...")
+            
+            # Save the final model with proper error handling
+            trained_unet.save_pretrained(
+                save_dir,
+                is_main_process=True,
+                safe_serialization=True  # Use safetensors format
+            )
+            
+            # Verify the saved weights
+            adapter_config_path = os.path.join(save_dir, "adapter_config.json")
+            adapter_model_path_bin = os.path.join(save_dir, "adapter_model.bin")
+            adapter_model_path_safe = os.path.join(save_dir, "adapter_model.safetensors")
+            
+            if not os.path.exists(adapter_config_path):
+                print(f"Warning: adapter_config.json not found in {save_dir}")
+                print("Directory contents:", os.listdir(save_dir))
+                raise ValueError(f"Failed to save adapter_config.json in {save_dir}")
+                
+            # Check for either .bin or .safetensors format
+            if not (os.path.exists(adapter_model_path_bin) or os.path.exists(adapter_model_path_safe)):
+                print(f"Warning: Neither adapter_model.bin nor adapter_model.safetensors found in {save_dir}")
+                print("Directory contents:", os.listdir(save_dir))
+                raise ValueError(f"Failed to save adapter model weights in {save_dir}")
+            
+            # Get the actual model path that exists
+            adapter_model_path = adapter_model_path_safe if os.path.exists(adapter_model_path_safe) else adapter_model_path_bin
+            
+            # Verify file sizes
+            config_size = os.path.getsize(adapter_config_path)
+            model_size = os.path.getsize(adapter_model_path)
+            
+            if config_size == 0 or model_size == 0:
+                raise ValueError(f"Saved files have zero size: config={config_size}, model={model_size}")
+                
+            print(f"Successfully saved final model:")
+            print(f"- Config file size: {config_size/1024:.2f} KB")
+            print(f"- Model file size: {model_size/1024/1024:.2f} MB")
+            print(f"- Model format: {'.safetensors' if os.path.exists(adapter_model_path_safe) else '.bin'}")
+            
+        except Exception as e:
+            print(f"\nError saving final model: {str(e)}")
+            print(f"Current directory: {os.getcwd()}")
+            print(f"Save directory: {save_dir}")
+            print(f"Directory exists: {os.path.exists(save_dir)}")
+            print(f"Directory permissions: {oct(os.stat(save_dir).st_mode)[-3:]}")
+            raise
+            
+        print(f"LoRA weights saved to {save_dir}")
         
     except Exception as e:
         print(f"\nError during training: {str(e)}")
