@@ -369,7 +369,7 @@ def train_unet(unet, vae, text_encoder, train_dataloader, tokenizer, noise_sched
         unet, optimizer, train_dataloader
     )
     
-    num_epochs = 3
+    num_epochs = 10
     progress_bar = tqdm(range(num_epochs), desc="Epochs")
     
     # Initialize loss tracking
